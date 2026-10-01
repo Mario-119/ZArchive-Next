@@ -11,16 +11,42 @@
 
 #include <cassert>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
-ZArchiveWriter::ZArchiveWriter(CB_NewOutputFile cbNewOutputFile, CB_WriteOutputData cbWriteOutputData, void* ctx) : m_cbCtx(ctx), m_cbNewOutputFile(cbNewOutputFile), m_cbWriteOutputData(cbWriteOutputData)
+namespace
 {
+	// output is collected and handed to the write callback in chunks of at least this size (fewer, larger, more uniform writes)
+	constexpr size_t kOutputFlushSize = 4 * 1024 * 1024;
+	// maximum number of full output buffers waiting for the I/O thread (bounds memory and provides back-pressure)
+	constexpr size_t kMaxQueuedIoBuffers = 8;
+	constexpr uint32_t kMaxThreads = 256;
+}
+
+ZArchiveWriter::ZArchiveWriter(CB_NewOutputFile cbNewOutputFile, CB_WriteOutputData cbWriteOutputData, void* ctx) : ZArchiveWriter(cbNewOutputFile, cbWriteOutputData, ctx, Options{})
+{
+}
+
+ZArchiveWriter::ZArchiveWriter(CB_NewOutputFile cbNewOutputFile, CB_WriteOutputData cbWriteOutputData, void* ctx, const Options& options) : m_cbNewOutputFile(cbNewOutputFile), m_cbWriteOutputData(cbWriteOutputData), m_cbCtx(ctx), m_options(options)
+{
+	m_options.numThreads = std::min(m_options.numThreads, kMaxThreads);
+	m_options.compressionLevel = std::clamp(m_options.compressionLevel, ZSTD_minCLevel(), ZSTD_maxCLevel());
 	cbNewOutputFile(-1, ctx);
 	m_mainShaCtx = (struct Sha_256*)malloc(sizeof(struct Sha_256));
 	sha_256_init(m_mainShaCtx, m_integritySha);
+	m_outPending.reserve(kOutputFlushSize + _ZARCHIVE::COMPRESSED_BLOCK_SIZE);
+	if (m_options.numThreads > 0)
+		StartPipeline();
+	else
+		m_legacyCctx = ZSTD_createCCtx();
 };
 
 ZArchiveWriter::~ZArchiveWriter()
 {
+	if (m_pipelineRunning || m_ioThreadRunning)
+		AbortPipeline(); // Finalize() was not called, discard whatever is still in flight
+	if (m_legacyCctx)
+		ZSTD_freeCCtx(m_legacyCctx);
 	free(m_mainShaCtx);
 }
 
@@ -122,11 +148,48 @@ uint32_t ZArchiveWriter::CreateNameEntry(std::string_view name)
 
 void ZArchiveWriter::OutputData(const void* data, size_t length)
 {
-	m_cbWriteOutputData(data, length, m_cbCtx);
+	// only ever called from one thread at a time (caller thread in legacy mode, commit thread in pipelined mode, caller thread again after the pipeline was joined)
+	const uint8_t* bytes = (const uint8_t*)data;
+	m_outPending.insert(m_outPending.end(), bytes, bytes + length);
 	m_currentCompressedWriteIndex += length;
-	// hash the data
+	if (m_outPending.size() >= kOutputFlushSize)
+		FlushOutput();
+}
+
+void ZArchiveWriter::FlushOutput()
+{
+	if (m_outPending.empty())
+		return;
+	// the hash always covers the output stream in order, and is computed in large pieces here
 	if (m_mainShaCtx)
-		sha_256_write(m_mainShaCtx, data, length);
+		sha_256_write(m_mainShaCtx, m_outPending.data(), m_outPending.size());
+	if (!m_ioThreadRunning)
+	{
+		m_cbWriteOutputData(m_outPending.data(), m_outPending.size(), m_cbCtx);
+		m_outPending.clear();
+		return;
+	}
+	// hand the filled buffer to the I/O thread and continue with a recycled one
+	std::vector<uint8_t> next;
+	{
+		std::unique_lock<std::mutex> lock(m_ioMutex);
+		m_cvIoSpace.wait(lock, [&]() { return m_ioQueue.size() < kMaxQueuedIoBuffers || m_ioAbort; });
+		if (m_ioAbort)
+		{
+			m_outPending.clear();
+			return;
+		}
+		m_ioQueue.emplace_back(std::move(m_outPending));
+		if (!m_ioFreeBuffers.empty())
+		{
+			next = std::move(m_ioFreeBuffers.back());
+			m_ioFreeBuffers.pop_back();
+		}
+	}
+	m_cvIoWork.notify_one();
+	next.clear();
+	next.reserve(kOutputFlushSize + _ZARCHIVE::COMPRESSED_BLOCK_SIZE);
+	m_outPending = std::move(next);
 }
 
 uint64_t ZArchiveWriter::GetCurrentOutputOffset() const
@@ -134,28 +197,197 @@ uint64_t ZArchiveWriter::GetCurrentOutputOffset() const
 	return m_currentCompressedWriteIndex;
 }
 
-void ZArchiveWriter::StoreBlock(const uint8_t* uncompressedData)
+void ZArchiveWriter::CommitBlock(const uint8_t* storedData, size_t storedSize)
 {
-	// compress and store
 	uint64_t compressedWriteOffset = GetCurrentOutputOffset();
-	m_compressionBuffer.resize(ZSTD_compressBound(_ZARCHIVE::COMPRESSED_BLOCK_SIZE));
-	size_t outputSize = ZSTD_compress(m_compressionBuffer.data(), m_compressionBuffer.size(), uncompressedData, _ZARCHIVE::COMPRESSED_BLOCK_SIZE, 6);
-	assert(outputSize >= 0);
-	if (outputSize >= _ZARCHIVE::COMPRESSED_BLOCK_SIZE)
-	{
-		// store block uncompressed if it is equal or larger than the input after compression
-		outputSize = _ZARCHIVE::COMPRESSED_BLOCK_SIZE;
-		OutputData(uncompressedData, _ZARCHIVE::COMPRESSED_BLOCK_SIZE);
-	}
-	else
-	{
-		OutputData(m_compressionBuffer.data(), outputSize);
-	}
+	OutputData(storedData, storedSize);
 	// add offset translation record
 	if ((m_numWrittenOffsetRecords % _ZARCHIVE::ENTRIES_PER_OFFSETRECORD) == 0)
 		m_compressionOffsetRecord.emplace_back().baseOffset = compressedWriteOffset;
-	m_compressionOffsetRecord.back().size[m_numWrittenOffsetRecords % _ZARCHIVE::ENTRIES_PER_OFFSETRECORD] = (uint16_t)outputSize - 1;
+	m_compressionOffsetRecord.back().size[m_numWrittenOffsetRecords % _ZARCHIVE::ENTRIES_PER_OFFSETRECORD] = (uint16_t)storedSize - 1;
 	m_numWrittenOffsetRecords++;
+}
+
+void ZArchiveWriter::StoreBlock(const uint8_t* uncompressedData)
+{
+	if (m_pipelineRunning)
+	{
+		SubmitBlock(uncompressedData);
+		return;
+	}
+	// legacy synchronous path (compression context is reused between blocks instead of being re-created for every block)
+	m_compressionBuffer.resize(ZSTD_compressBound(_ZARCHIVE::COMPRESSED_BLOCK_SIZE));
+	size_t outputSize = ZSTD_compressCCtx(m_legacyCctx, m_compressionBuffer.data(), m_compressionBuffer.size(), uncompressedData, _ZARCHIVE::COMPRESSED_BLOCK_SIZE, m_options.compressionLevel);
+	if (ZSTD_isError(outputSize) || outputSize >= _ZARCHIVE::COMPRESSED_BLOCK_SIZE)
+		CommitBlock(uncompressedData, _ZARCHIVE::COMPRESSED_BLOCK_SIZE); // store block uncompressed if it is equal or larger than the input after compression
+	else
+		CommitBlock(m_compressionBuffer.data(), outputSize);
+}
+
+// ---------------------------------------------------------------------------------------------
+// pipelined compression: caller thread -> N compression workers -> commit thread (in-order, hashing) -> I/O thread (write callback)
+// ---------------------------------------------------------------------------------------------
+
+void ZArchiveWriter::StartPipeline()
+{
+	const size_t numSlots = std::max<size_t>(128, (size_t)m_options.numThreads * 32);
+	m_slots.resize(numSlots);
+	const size_t outputBound = ZSTD_compressBound(_ZARCHIVE::COMPRESSED_BLOCK_SIZE);
+	for (auto& slot : m_slots)
+	{
+		slot.input.resize(_ZARCHIVE::COMPRESSED_BLOCK_SIZE);
+		slot.output.resize(outputBound);
+	}
+	m_pipelineRunning = true;
+	m_ioThreadRunning = true;
+	m_ioThread = std::thread(&ZArchiveWriter::IoThreadMain, this);
+	m_commitThread = std::thread(&ZArchiveWriter::CommitThreadMain, this);
+	m_workers.reserve(m_options.numThreads);
+	for (uint32_t i = 0; i < m_options.numThreads; i++)
+		m_workers.emplace_back(&ZArchiveWriter::WorkerThreadMain, this);
+}
+
+void ZArchiveWriter::SubmitBlock(const uint8_t* uncompressedData)
+{
+	const uint64_t seq = m_nextSubmitSeq++;
+	BlockSlot& slot = m_slots[seq % m_slots.size()];
+	{
+		std::unique_lock<std::mutex> lock(m_pipeMutex);
+		m_cvSlotFree.wait(lock, [&]() { return slot.state == BlockSlot::State::Free || m_abort; });
+		if (m_abort)
+			return;
+		slot.state = BlockSlot::State::Filling;
+	}
+	memcpy(slot.input.data(), uncompressedData, _ZARCHIVE::COMPRESSED_BLOCK_SIZE);
+	{
+		std::lock_guard<std::mutex> lock(m_pipeMutex);
+		slot.state = BlockSlot::State::Queued;
+		m_workQueue.push_back(seq);
+	}
+	m_cvWork.notify_one();
+}
+
+void ZArchiveWriter::WorkerThreadMain()
+{
+	ZSTD_CCtx* cctx = ZSTD_createCCtx();
+	const int level = m_options.compressionLevel;
+	while (true)
+	{
+		uint64_t seq;
+		{
+			std::unique_lock<std::mutex> lock(m_pipeMutex);
+			m_cvWork.wait(lock, [&]() { return !m_workQueue.empty() || m_finishRequested || m_abort; });
+			if (m_abort || m_workQueue.empty())
+				break; // aborted, or finishing and nothing left to compress
+			seq = m_workQueue.front();
+			m_workQueue.pop_front();
+		}
+		BlockSlot& slot = m_slots[seq % m_slots.size()];
+		size_t outputSize = ZSTD_compressCCtx(cctx, slot.output.data(), slot.output.size(), slot.input.data(), _ZARCHIVE::COMPRESSED_BLOCK_SIZE, level);
+		if (ZSTD_isError(outputSize) || outputSize >= _ZARCHIVE::COMPRESSED_BLOCK_SIZE)
+			outputSize = _ZARCHIVE::COMPRESSED_BLOCK_SIZE; // stored uncompressed, the commit thread will use slot.input
+		{
+			std::lock_guard<std::mutex> lock(m_pipeMutex);
+			slot.outputSize = outputSize;
+			slot.state = BlockSlot::State::Done;
+		}
+		m_cvDone.notify_one();
+	}
+	ZSTD_freeCCtx(cctx);
+}
+
+void ZArchiveWriter::CommitThreadMain()
+{
+	uint64_t seq = 0;
+	while (true)
+	{
+		BlockSlot* slot;
+		{
+			std::unique_lock<std::mutex> lock(m_pipeMutex);
+			m_cvDone.wait(lock, [&]() { return m_abort || (m_finishRequested && seq == m_totalSubmitted) || m_slots[seq % m_slots.size()].state == BlockSlot::State::Done; });
+			if (m_abort || (m_finishRequested && seq == m_totalSubmitted))
+				break;
+			slot = &m_slots[seq % m_slots.size()];
+		}
+		if (slot->outputSize >= _ZARCHIVE::COMPRESSED_BLOCK_SIZE)
+			CommitBlock(slot->input.data(), _ZARCHIVE::COMPRESSED_BLOCK_SIZE);
+		else
+			CommitBlock(slot->output.data(), slot->outputSize);
+		{
+			std::lock_guard<std::mutex> lock(m_pipeMutex);
+			slot->state = BlockSlot::State::Free;
+		}
+		m_cvSlotFree.notify_one();
+		seq++;
+	}
+}
+
+void ZArchiveWriter::IoThreadMain()
+{
+	while (true)
+	{
+		std::vector<uint8_t> buffer;
+		{
+			std::unique_lock<std::mutex> lock(m_ioMutex);
+			m_cvIoWork.wait(lock, [&]() { return !m_ioQueue.empty() || m_ioStop || m_ioAbort; });
+			if (m_ioAbort || m_ioQueue.empty())
+				return;
+			buffer = std::move(m_ioQueue.front());
+			m_ioQueue.pop_front();
+		}
+		m_cvIoSpace.notify_one();
+		m_cbWriteOutputData(buffer.data(), buffer.size(), m_cbCtx);
+		buffer.clear();
+		{
+			std::lock_guard<std::mutex> lock(m_ioMutex);
+			m_ioFreeBuffers.emplace_back(std::move(buffer));
+		}
+	}
+}
+
+void ZArchiveWriter::FinishPipeline()
+{
+	{
+		std::lock_guard<std::mutex> lock(m_pipeMutex);
+		m_finishRequested = true;
+		m_totalSubmitted = m_nextSubmitSeq;
+	}
+	m_cvWork.notify_all();
+	m_cvDone.notify_all();
+	for (auto& t : m_workers)
+		t.join();
+	m_workers.clear();
+	m_commitThread.join();
+	m_pipelineRunning = false;
+	// from here on the calling thread takes over the role of the commit thread (writes the remaining sections in order).
+	// The I/O thread keeps running until Finalize() has queued the last buffer.
+}
+
+void ZArchiveWriter::AbortPipeline()
+{
+	{
+		std::lock_guard<std::mutex> lock(m_pipeMutex);
+		m_abort = true;
+	}
+	{
+		std::lock_guard<std::mutex> lock(m_ioMutex);
+		m_ioAbort = true;
+	}
+	m_cvWork.notify_all();
+	m_cvDone.notify_all();
+	m_cvSlotFree.notify_all();
+	m_cvIoWork.notify_all();
+	m_cvIoSpace.notify_all();
+	for (auto& t : m_workers)
+		if (t.joinable())
+			t.join();
+	m_workers.clear();
+	if (m_commitThread.joinable())
+		m_commitThread.join();
+	if (m_ioThread.joinable())
+		m_ioThread.join();
+	m_pipelineRunning = false;
+	m_ioThreadRunning = false;
 }
 
 void ZArchiveWriter::AppendData(const void* data, size_t size)
@@ -199,6 +431,9 @@ void ZArchiveWriter::Finalize()
 		padBuffer.resize(_ZARCHIVE::COMPRESSED_BLOCK_SIZE - m_currentWriteBuffer.size());
 		AppendData(padBuffer.data(), padBuffer.size());
 	}
+	// wait until all queued blocks have been compressed and written in order
+	if (m_pipelineRunning)
+		FinishPipeline();
 	m_footer.sectionCompressedData.offset = 0;
 	m_footer.sectionCompressedData.size = GetCurrentOutputOffset();
 	// pad to 8 byte
@@ -212,6 +447,17 @@ void ZArchiveWriter::Finalize()
 	WriteFileTree();
 	WriteMetaData();
 	WriteFooter();
+	FlushOutput();
+	if (m_ioThreadRunning)
+	{
+		{
+			std::lock_guard<std::mutex> lock(m_ioMutex);
+			m_ioStop = true;
+		}
+		m_cvIoWork.notify_all();
+		m_ioThread.join();
+		m_ioThreadRunning = false;
+	}
 }
 
 void ZArchiveWriter::WriteOffsetRecords()
@@ -332,6 +578,7 @@ void ZArchiveWriter::WriteFooter()
 
 	_ZARCHIVE::Footer tmp;
 
+	FlushOutput(); // make sure everything written so far has been hashed
 	// serialize and hash the footer with all hash bytes set to zero
 	memset(m_footer.integrityHash, 0, 32);
 	_ZARCHIVE::Footer::Serialize(&m_footer, &tmp);

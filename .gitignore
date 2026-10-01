@@ -5,3 +5,6 @@ cmake-build-*/
 .vs/
 out/
 CMakeSettings.json
+
+# build output
+build/

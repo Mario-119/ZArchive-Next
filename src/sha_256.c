@@ -121,6 +121,118 @@ static inline void consume_chunk(uint32_t *h, const uint8_t *p)
 		h[i] += ah[i];
 }
 
+
+/*
+ * Hardware accelerated (x86 SHA extensions) block function with runtime CPU detection.
+ * Falls back to the portable implementation above if the CPU lacks SHA-NI/SSE4.1/SSSE3.
+ * Define ZARCHIVE_DISABLE_SHA_NI to compile this out.
+ */
+#if !defined(ZARCHIVE_DISABLE_SHA_NI) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+#define ZARCHIVE_HAVE_SHA_NI_PATH 1
+#include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define ZA_SHA_TARGET
+#else
+#include <cpuid.h>
+#define ZA_SHA_TARGET __attribute__((target("sha,sse4.1,ssse3")))
+#endif
+
+static int cpu_has_sha_ni(void)
+{
+#if defined(_MSC_VER)
+	int r[4];
+	__cpuid(r, 0);
+	if (r[0] < 7)
+		return 0;
+	__cpuid(r, 1);
+	int hasSsse3 = (r[2] >> 9) & 1;
+	int hasSse41 = (r[2] >> 19) & 1;
+	__cpuidex(r, 7, 0);
+	int hasSha = (r[1] >> 29) & 1;
+	return hasSsse3 && hasSse41 && hasSha;
+#else
+	unsigned int a, b, c, d;
+	if (__get_cpuid_max(0, 0) < 7)
+		return 0;
+	__cpuid(1, a, b, c, d);
+	int hasSsse3 = (c >> 9) & 1;
+	int hasSse41 = (c >> 19) & 1;
+	__cpuid_count(7, 0, a, b, c, d);
+	int hasSha = (b >> 29) & 1;
+	return hasSsse3 && hasSse41 && hasSha;
+#endif
+}
+
+/* one group of four rounds; i is a compile time constant (0..15) */
+#define ZA_SHA_GROUP(i)                                                                                  \
+	do {                                                                                                 \
+		__m128i cur;                                                                                     \
+		if ((i) < 4) {                                                                                   \
+			cur = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(data + 16 * (i))), mask);            \
+		} else {                                                                                         \
+			__m128i t = _mm_sha256msg1_epu32(m[(i) & 3], m[((i) + 1) & 3]);                              \
+			t = _mm_add_epi32(t, _mm_alignr_epi8(m[((i) + 3) & 3], m[((i) + 2) & 3], 4));                \
+			cur = _mm_sha256msg2_epu32(t, m[((i) + 3) & 3]);                                             \
+		}                                                                                                \
+		m[(i) & 3] = cur;                                                                                \
+		__m128i msg = _mm_add_epi32(cur, _mm_loadu_si128((const __m128i*)&_sha256_k[4 * (i)]));          \
+		state1 = _mm_sha256rnds2_epu32(state1, state0, msg);                                             \
+		msg = _mm_shuffle_epi32(msg, 0x0E);                                                              \
+		state0 = _mm_sha256rnds2_epu32(state0, state1, msg);                                             \
+	} while (0)
+
+ZA_SHA_TARGET
+static void consume_blocks_shani(uint32_t* state, const uint8_t* data, size_t numBlocks)
+{
+	const __m128i mask = _mm_set_epi64x(0x0c0d0e0f08090a0bULL, 0x0405060700010203ULL);
+	__m128i tmp = _mm_loadu_si128((const __m128i*)&state[0]);
+	__m128i state1 = _mm_loadu_si128((const __m128i*)&state[4]);
+	tmp = _mm_shuffle_epi32(tmp, 0xB1);
+	state1 = _mm_shuffle_epi32(state1, 0x1B);
+	__m128i state0 = _mm_alignr_epi8(tmp, state1, 8);
+	state1 = _mm_blend_epi16(state1, tmp, 0xF0);
+
+	while (numBlocks--) {
+		const __m128i abefSave = state0;
+		const __m128i cdghSave = state1;
+		__m128i m[4];
+		ZA_SHA_GROUP(0);  ZA_SHA_GROUP(1);  ZA_SHA_GROUP(2);  ZA_SHA_GROUP(3);
+		ZA_SHA_GROUP(4);  ZA_SHA_GROUP(5);  ZA_SHA_GROUP(6);  ZA_SHA_GROUP(7);
+		ZA_SHA_GROUP(8);  ZA_SHA_GROUP(9);  ZA_SHA_GROUP(10); ZA_SHA_GROUP(11);
+		ZA_SHA_GROUP(12); ZA_SHA_GROUP(13); ZA_SHA_GROUP(14); ZA_SHA_GROUP(15);
+		state0 = _mm_add_epi32(state0, abefSave);
+		state1 = _mm_add_epi32(state1, cdghSave);
+		data += 64;
+	}
+
+	tmp = _mm_shuffle_epi32(state0, 0x1B);
+	state1 = _mm_shuffle_epi32(state1, 0xB1);
+	state0 = _mm_blend_epi16(tmp, state1, 0xF0);
+	state1 = _mm_alignr_epi8(state1, tmp, 8);
+	_mm_storeu_si128((__m128i*)&state[0], state0);
+	_mm_storeu_si128((__m128i*)&state[4], state1);
+}
+#endif /* ZARCHIVE_HAVE_SHA_NI_PATH */
+
+/* process numBlocks consecutive 64 byte blocks, picks the fastest available implementation */
+static void consume_blocks(uint32_t* h, const uint8_t* p, size_t numBlocks)
+{
+#ifdef ZARCHIVE_HAVE_SHA_NI_PATH
+	static int useShaNi = -1; /* benign race: every thread computes the same value */
+	if (useShaNi < 0)
+		useShaNi = cpu_has_sha_ni();
+	if (useShaNi) {
+		consume_blocks_shani(h, p, numBlocks);
+		return;
+	}
+#endif
+	while (numBlocks--) {
+		consume_chunk(h, p);
+		p += SIZE_OF_SHA_256_CHUNK;
+	}
+}
+
 /*
  * Public functions. See header file for documentation.
  */
@@ -157,9 +269,10 @@ void sha_256_write(struct Sha_256 *sha_256, const void *data, size_t len)
 		 * necessary. We operate directly on the input data instead.
 		 */
 		if (sha_256->space_left == SIZE_OF_SHA_256_CHUNK && len >= SIZE_OF_SHA_256_CHUNK) {
-			consume_chunk(sha_256->h, p);
-			len -= SIZE_OF_SHA_256_CHUNK;
-			p += SIZE_OF_SHA_256_CHUNK;
+			const size_t numBlocks = len / SIZE_OF_SHA_256_CHUNK;
+			consume_blocks(sha_256->h, p, numBlocks);
+			len -= numBlocks * SIZE_OF_SHA_256_CHUNK;
+			p += numBlocks * SIZE_OF_SHA_256_CHUNK;
 			continue;
 		}
 		/* General case, no particular optimization. */
@@ -169,7 +282,7 @@ void sha_256_write(struct Sha_256 *sha_256, const void *data, size_t len)
 		len -= consumed_len;
 		p += consumed_len;
 		if (sha_256->space_left == 0) {
-			consume_chunk(sha_256->h, sha_256->chunk);
+			consume_blocks(sha_256->h, sha_256->chunk, 1);
 			sha_256->chunk_pos = sha_256->chunk;
 			sha_256->space_left = SIZE_OF_SHA_256_CHUNK;
 		} else {
@@ -198,7 +311,7 @@ uint8_t *sha_256_close(struct Sha_256 *sha_256)
 	 */
 	if (space_left < TOTAL_LEN_LEN) {
 		memset(pos, 0x00, space_left);
-		consume_chunk(h, sha_256->chunk);
+		consume_blocks(h, sha_256->chunk, 1);
 		pos = sha_256->chunk;
 		space_left = SIZE_OF_SHA_256_CHUNK;
 	}
@@ -213,7 +326,7 @@ uint8_t *sha_256_close(struct Sha_256 *sha_256)
 		pos[i] = (uint8_t)len;
 		len >>= 8;
 	}
-	consume_chunk(h, sha_256->chunk);
+	consume_blocks(h, sha_256->chunk, 1);
 	/* Produce the final hash value (big-endian): */
 	int j;
 	uint8_t *const hash = sha_256->hash;

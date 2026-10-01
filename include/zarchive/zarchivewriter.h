@@ -4,8 +4,15 @@
 #include <vector>
 #include <string_view>
 #include <unordered_map>
+#include <deque>
+#include <memory>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 #include "zarchivecommon.h"
+
+struct ZSTD_CCtx_s; // zstd compression context (forward declaration, avoids leaking zstd.h to users of this header)
 
 class ZArchiveWriter
 {
@@ -30,7 +37,20 @@ public:
 	typedef void(*CB_NewOutputFile)(const int32_t partIndex, void* ctx);
 	typedef void(*CB_WriteOutputData)(const void* data, size_t length, void* ctx);
 
+	struct Options
+	{
+		// Number of block compression threads.
+		// 0 = legacy mode: everything runs synchronously on the calling thread (callbacks are invoked from the calling thread)
+		// >0 = pipelined mode: N compression threads plus one thread that orders/hashes the output and one thread that performs
+		//      the output callbacks. Callbacks are then invoked from a background thread, but never concurrently and always in order.
+		// The produced archive is byte-identical regardless of this setting.
+		uint32_t numThreads{ 0 };
+		// zstd compression level (clamped to the range supported by the linked zstd)
+		int compressionLevel{ 6 };
+	};
+
 	ZArchiveWriter(CB_NewOutputFile cbNewOutputFile, CB_WriteOutputData cbWriteOutputData, void* ctx);
+	ZArchiveWriter(CB_NewOutputFile cbNewOutputFile, CB_WriteOutputData cbWriteOutputData, void* ctx, const Options& options);
 	~ZArchiveWriter();
 
 	bool StartNewFile(const char* path); // creates a new virtual file and makes it active
@@ -45,9 +65,28 @@ private:
 	uint32_t CreateNameEntry(std::string_view name);
 
 	void OutputData(const void* data, size_t length);
+	void FlushOutput();
 	uint64_t GetCurrentOutputOffset() const;
 
 	void StoreBlock(const uint8_t* uncompressedData);
+	void CommitBlock(const uint8_t* storedData, size_t storedSize); // storedSize == COMPRESSED_BLOCK_SIZE means the block is stored uncompressed
+
+	// pipelined compression
+	struct BlockSlot
+	{
+		enum class State : uint8_t { Free, Filling, Queued, Done };
+		std::vector<uint8_t> input;
+		std::vector<uint8_t> output;
+		size_t outputSize{ 0 };
+		State state{ State::Free };
+	};
+	void StartPipeline();
+	void SubmitBlock(const uint8_t* uncompressedData);
+	void FinishPipeline();
+	void AbortPipeline();
+	void WorkerThreadMain();
+	void CommitThreadMain();
+	void IoThreadMain();
 
 	void WriteOffsetRecords();
 	void WriteNameTable();
@@ -69,8 +108,37 @@ private:
 	// footer
 	_ZARCHIVE::Footer m_footer;
 	// writes and compression
+	Options m_options;
 	std::vector<uint8_t> m_currentWriteBuffer;
 	std::vector<uint8_t> m_compressionBuffer;
+	ZSTD_CCtx_s* m_legacyCctx{ nullptr };
+	// output coalescing (data is collected here and handed to the write callback in large chunks)
+	std::vector<uint8_t> m_outPending;
+	// pipeline state
+	bool m_pipelineRunning{ false };
+	bool m_ioThreadRunning{ false };
+	std::vector<BlockSlot> m_slots;
+	std::vector<std::thread> m_workers;
+	std::thread m_commitThread;
+	std::thread m_ioThread;
+	std::mutex m_pipeMutex;
+	std::condition_variable m_cvWork;     // workers wait for queued blocks
+	std::condition_variable m_cvDone;     // commit thread waits for compressed blocks
+	std::condition_variable m_cvSlotFree; // producer waits for a free slot
+	std::deque<uint64_t> m_workQueue;
+	uint64_t m_nextSubmitSeq{ 0 };        // producer side only
+	uint64_t m_nextCommitSeq{ 0 };        // commit thread only (guarded by m_pipeMutex for waiters)
+	uint64_t m_totalSubmitted{ 0 };       // valid once m_finishRequested is set
+	bool m_finishRequested{ false };
+	bool m_abort{ false };
+	// write-behind queue
+	std::mutex m_ioMutex;
+	std::condition_variable m_cvIoWork;
+	std::condition_variable m_cvIoSpace;
+	std::deque<std::vector<uint8_t>> m_ioQueue;
+	std::vector<std::vector<uint8_t>> m_ioFreeBuffers;
+	bool m_ioStop{ false };
+	bool m_ioAbort{ false };
 	uint64_t m_currentCompressedWriteIndex{ 0 }; // output file write index
 	uint64_t m_currentInputOffset{ 0 }; // current offset within uncompressed file data
 	// uncompressed-to-compressed offset records
@@ -79,4 +147,4 @@ private:
 	// hashing
 	struct Sha_256* m_mainShaCtx{};
 	uint8_t m_integritySha[32];
-};
+};
