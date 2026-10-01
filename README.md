@@ -11,8 +11,8 @@
 - **Read-ahead and write-behind I/O.** Input files are read on a separate thread in large sequential chunks, and output is written in large sequential chunks, so the CPU and the disk can work at the same time.
 - **Reused zstd contexts** instead of creating a new one for every 64 KiB block.
 - **Better error handling** when packing: read errors and a full disk now abort the operation instead of silently producing a bad archive.
-- **New command line options** `-t` (threads) and `-l` (compression level), plus a throughput summary when packing finishes.
-- **Release build by default** when no CMake build type is given.
+- **New command line options** `-t` (threads) and `-l` (compression level). Default -t level uses all available logical cores.  
+
 
 ## Overview
 ZArchive is yet another file archive format. Think of zip, tar, 7z, etc. but with the requirement of allowing random-access reads and supporting compression.
