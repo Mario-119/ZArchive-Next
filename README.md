@@ -1,6 +1,6 @@
 # ZArchive-Next
 
-> **This is a fork of [Exzap/ZArchive](https://github.com/Exzap/ZArchive).** The archive format and the reader are unchanged. This fork intends to speed up compression/decompression of .zar files while also being more efficiant. Please report issues with the changes to this repo, not the upstream one.
+> **This is a WiP fork of [Exzap/ZArchive](https://github.com/Exzap/ZArchive).** The archive format and the reader are unchanged. This fork intends to speed up compression/decompression of .zar files while also being more efficient. Please report issues with the changes to this repo, not the upstream one.
 
 - AI (Claude) was used to help with some of the optimizations. If you find this to be not to your liking, I suggest that you use the original as that remains stable and works fine (credit to Exzap!)
 
